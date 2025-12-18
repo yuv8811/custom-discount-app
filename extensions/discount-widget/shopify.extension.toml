@@ -1,0 +1,7 @@
+api_version = "2026-01"
+name = "Discount Widget"
+handle = "discount-widget"
+
+uid = "d6afe511-c8e4-7eec-230c-c5eda3b571598b3eb33e"
+
+type = "theme"
