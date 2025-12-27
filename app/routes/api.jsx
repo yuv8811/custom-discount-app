@@ -11,22 +11,23 @@ export const action = async ({ request }) => {
         return data({ error: "No code provided" }, { status: 400 });
     }
 
-    // 0. Fetch logged-in customer ID from the request (sent by Shopify App Proxy)
     const url = new URL(request.url);
     const loggedInCustomerId = url.searchParams.get("logged_in_customer_id");
     console.log("Logged In Customer ID:", loggedInCustomerId);
 
-    // 1. Validate the gift card by querying real gift cards from Shopify Admin
+    console.log("--- Starting Gift Card Validation for code:", code, "---");
     let giftCards = [];
     try {
+        console.log("Fetching gift cards from Admin API (limit 250)...");
         const gcResponse = await admin.graphql(
             `#graphql
             query getGiftCards {
-              giftCards(first: 50, query: "enabled:true") {
+              giftCards(first: 250, reverse: true) {
                 edges {
                   node {
                     id
                     lastCharacters
+                    enabled
                     balance {
                       amount
                       currencyCode
@@ -41,43 +42,49 @@ export const action = async ({ request }) => {
         );
 
         const gcData = await gcResponse.json();
-        console.log("Gift Card Search Response:", JSON.stringify(gcData, null, 2));
 
         if (gcData.errors) {
-            console.error("GraphQL Errors in GC Search:", gcData.errors);
+            console.error("GraphQL Errors in GC Search:", JSON.stringify(gcData.errors, null, 2));
         } else {
             giftCards = gcData.data?.giftCards?.edges || [];
+            console.log(`Successfully fetched ${giftCards.length} gift cards.`);
         }
     } catch (err) {
         console.error("Failed to fetch gift cards:", err);
     }
 
-    // Clean the input code (remove spaces, etc)
-    const normalizedCode = code.replace(/\s+/g, '').toUpperCase();
+    const normalizedCode = code ? code.replace(/\s+/g, '').toUpperCase() : "";
+    console.log("Normalized Input Code:", normalizedCode);
 
     const matchingGC = giftCards.find(({ node }) => {
-        if (!node || !node.lastCharacters) return false;
+        if (!node) return false;
+
+        if (!node.enabled) return false;
+        if (!node.lastCharacters) return false;
 
         const lastChars = node.lastCharacters.toUpperCase();
-        const matches = normalizedCode === `GIFT-${lastChars}` ||
-            normalizedCode.endsWith(lastChars);
 
-        if (!matches) return false;
+        const endsWithMatch = normalizedCode.endsWith(lastChars);
+        const explicitMatch = normalizedCode === `GIFT-${lastChars}`;
 
-        // MATCH CUSTOMER ID Check
-        // Shopify GIDs are like gid://shopify/Customer/12345678
-        // url.searchParams.get("logged_in_customer_id") is just the digit part or null
-        const giftCardCustomerId = node.customer?.id.split('/').pop() || null;
+        const matches = endsWithMatch || explicitMatch;
 
-        console.log(`[GC Debug] Comparing GC Customer ${giftCardCustomerId} with LoggedIn Customer ${loggedInCustomerId}`);
+        if (matches) {
+            console.log(`[Strict Match Found] Card ID: ${node.id}, LastChars: ${lastChars}, Customer: ${node.customer?.id || 'None'}`);
 
-        if (giftCardCustomerId !== loggedInCustomerId) {
-            console.log(`[GC Debug] Customer mismatch! Rejecting gift card.`);
-            return false;
+            const giftCardCustomerId = node.customer?.id ? node.customer.id.split('/').pop() : null;
+
+            console.log(`[GC Debug] Comparing GC Customer ${giftCardCustomerId} with LoggedIn Customer ${loggedInCustomerId}`);
+
+            if (giftCardCustomerId && giftCardCustomerId !== loggedInCustomerId) {
+                console.log(`[GC Debug] Customer mismatch! Rejecting gift card.`);
+                return false;
+            }
+
+            return true;
         }
 
-        console.log(`[GC Debug] Checking "${lastChars}" against "${normalizedCode}": Match=${matches}`);
-        return matches;
+        return false;
     });
 
 
@@ -86,9 +93,37 @@ export const action = async ({ request }) => {
         const balance = parseFloat(gc.balance.amount);
         const amountToApply = Math.min(balance, (cartTotal / 100));
 
-        // CREATE A REAL SHOPIFY DISCOUNT
-        // This is what actually "mutates" the price at checkout
-        const tempCode = `GC-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+        const targetDiscountCode = normalizedCode;
+
+        const checkExistingResponse = await admin.graphql(
+            `#graphql
+            query checkDiscount($code: String!) {
+              codeDiscountNodeByCode(code: $code) {
+                id
+                codeDiscount {
+                   ... on DiscountCodeBasic {
+                     status
+                   }
+                }
+              }
+            }`,
+            { variables: { code: targetDiscountCode } }
+        );
+        const existingData = await checkExistingResponse.json();
+
+        if (existingData.data?.codeDiscountNodeByCode) {
+            console.log(`Discount code ${targetDiscountCode} already exists. Reusing it.`);
+            return data({
+                valid: true,
+                type: "gift_card",
+                appliedAmount: amountToApply,
+                totalBalance: balance,
+                newBalance: balance - amountToApply,
+                discountCode: targetDiscountCode,
+                currency: gc.balance.currencyCode,
+                message: `Applied ${gc.balance.currencyCode} ${amountToApply.toFixed(2)} from your gift card.`
+            });
+        }
 
         try {
             const discountCreateResponse = await admin.graphql(
@@ -108,9 +143,9 @@ export const action = async ({ request }) => {
                     variables: {
                         basicCodeDiscount: {
                             title: `Gift Card - ${gc.lastCharacters}`,
-                            code: tempCode,
+                            code: targetDiscountCode,
                             startsAt: new Date(Date.now() - 60000).toISOString(),
-                            endsAt: new Date(Date.now() + 1000 * 60 * 60).toISOString(),
+                            endsAt: new Date(Date.now() + 1000 * 60 * 60).toISOString(), // Valid for 1 hour
                             customerSelection: {
                                 all: true
                             },
@@ -125,7 +160,7 @@ export const action = async ({ request }) => {
                                     all: true
                                 }
                             },
-                            appliesOncePerCustomer: true
+                            appliesOncePerCustomer: false
                         }
                     }
                 }
@@ -139,9 +174,9 @@ export const action = async ({ request }) => {
                     valid: true,
                     type: "gift_card",
                     appliedAmount: amountToApply,
-                    totalBalance: balance, // Add total balance
+                    totalBalance: balance,
                     newBalance: balance - amountToApply,
-                    discountCode: tempCode,
+                    discountCode: targetDiscountCode,
                     currency: gc.balance.currencyCode,
                     message: `Applied ${gc.balance.currencyCode} ${amountToApply.toFixed(2)} from your gift card.`
                 });
@@ -160,7 +195,6 @@ export const action = async ({ request }) => {
         }
     }
 
-    // 2. Check for standard Shopify Discounts
     const response = await admin.graphql(
         `#graphql
     query checkDiscount($code: String!) {
@@ -189,7 +223,6 @@ export const action = async ({ request }) => {
 
     const graphqlData = await response.json();
 
-    // Log for debugging (you'll see this in your terminal)
     console.log("GraphQL Response for code:", code, JSON.stringify(graphqlData, null, 2));
 
     if (graphqlData.errors) {
@@ -212,7 +245,6 @@ export const action = async ({ request }) => {
     return data({ valid: false, message: `Code "${code}" not found or invalid` });
 };
 
-// Handle GET requests if needed
 export const loader = async ({ request }) => {
     return data({ message: "Storefront API proxy is active" });
 };

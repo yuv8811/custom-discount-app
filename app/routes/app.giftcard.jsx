@@ -23,7 +23,7 @@ export const loader = async ({ request }) => {
     const response = await admin.graphql(
         `#graphql
     query GetGiftCards {
-      giftCards(first: 20, sortKey: CREATED_AT, reverse: true) {
+      giftCards(first: 50, sortKey: CREATED_AT, reverse: true) {
         edges {
           node {
             id
